@@ -311,74 +311,64 @@ namespace GitTfs.VsCommon
 
                 try
                 {
-                    // This method now handles the scenario where a valid branch has been detected for migration but its
-                    // root/branch changeset is *not* the first changeset in its history.
-                    //
-                    // This situation can occur when:
-                    //
-                    //  1) My project is created (e.g. $/MyProject/MyTrunk) (C1)
-                    //  2) Work is done on $/MyProject/MyTrunk (C2)
-                    //  3) A folder is created based on the contents of $/MyProject/MyTrunk without branching (e.g. $/MyProject/MyFeature) (C3)
-                    //  4) Folder $/MyProject/MyFeature is deleted (C4)
-                    //  5) Branch $/MyProject/MyFeature is created from $/MyProject/MyTrunk (C5)
-                    //
-                    // In this case, the code previously assumed C3 is the root changeset and would only check for merge history in it.
-                    // Now, the code does not assume any given changeset is the branch root and instead crawls its history in
-                    // batches to find the first changeset with merge history and assumes that changeset is the root.
-
-                    const int batchSize = 100;
-
-                    IEnumerable<MergeInfo> branchChangesetInTargetBranch = null;
-                    for (var batchNumber = 1; branchChangesetInTargetBranch == null; batchNumber++)
-                    {
-                        var changesetsToRetrieve = batchNumber * batchSize;
-
-                        var changesetEnumerable = VersionControl.QueryHistory(tfsPathBranchToCreate, VersionSpec.Latest, 0,
-                            RecursionType.Full, null, null, null, changesetsToRetrieve, false, false, false, true).Cast<Changeset>();
-
-                        if (batchNumber > 1)
-                        {
-                            changesetEnumerable = changesetEnumerable.Skip((batchNumber - 1) * batchSize).Take(batchSize);
-                        }
-
-                        // ToList'ed because inspecting the enumerable during debugging was resulting in TFS timeouts
-                        var changesets = changesetEnumerable.ToList();
-
-                        // If our batch has no results, there's nothing left to check; we're done.
-                        if (!changesets.Any())
-                        {
-                            break;
-                        }
-
-                        foreach (var changeset in changesets)
-                        {
-                            var branchChangesetsInTargetBranchForBatch = GetMergeInfo(tfsPathBranchToCreate, tfsPathParentBranch, changeset.ChangesetId, lastChangesetIdToCheck);
-
-                            if (branchChangesetsInTargetBranchForBatch.Any())
-                            {
-                                branchChangesetInTargetBranch = branchChangesetsInTargetBranchForBatch;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (branchChangesetInTargetBranch == null)
-                    {
-                        throw new GitTfsException("An unexpected error occurred when trying to find the root changeset.\nFailed to find first changeset for " + tfsPathBranchToCreate);
-                    }
-
+                    RootBranch rootBranch;
                     string renameFromBranch;
-                    var rootChangesetInParentBranch =
-                        GetRelevantChangesetBasedOnChangeType(branchChangesetInTargetBranch, tfsPathParentBranch, tfsPathBranchToCreate, out renameFromBranch);
 
-                    var rootChangesetMergeInfo = branchChangesetInTargetBranch.First();
+                    var changeset = VersionControl.QueryHistory(tfsPathBranchToCreate
+                                                                , VersionSpec.Latest, 0,
+                                                                RecursionType.Full, null
+                                                                , null, null, 1
+                                                                , false // includeChanges
+                                                                , false, false, true) // sortAscending
+                                                                .Cast<Changeset>().FirstOrDefault();
 
-                    // If the merge info indicates our parent branch root changeset is the source, then our child changeset
-                    // will be the target. Otherwise, they're swapped.
-                    var rootChangesetInChildBranch = rootChangesetMergeInfo.SourceChangeset == rootChangesetInParentBranch ?
-                        rootChangesetMergeInfo.TargetChangeset : rootChangesetMergeInfo.SourceChangeset;
+                    if (changeset.Comment.StartsWith("LatestVersionSpec instance 0", StringComparison.Ordinal))
+                    {
+                        //int rootChangesetInChildBranch = VersionControl.QueryHistory(tfsPathBranchToCreate
+                        //                                                , VersionSpec.Latest, 0,
+                        //                                                RecursionType.Full, null
+                        //                                                , null, null, 1
+                        //                                                , false // includeChanges
+                        //                                                , false, false, true) // sortAscending
+                        //                                                .Cast<Changeset>().FirstOrDefault().ChangesetId;
+                        int rootChangesetInChildBranch = changeset.ChangesetId;
 
-                    var rootBranch = new RootBranch(rootChangesetInParentBranch, rootChangesetInChildBranch, tfsPathBranchToCreate);
+                        int rootChangesetInParentBranch = VersionControl.QueryHistory(tfsPathParentBranch
+                                                                        , VersionSpec.Latest, 0,
+                                                                        RecursionType.Full, null
+                                                                        , null, new ChangesetVersionSpec(rootChangesetInChildBranch), 1
+                                                                        , false // includeChanges
+                                                                        , false)
+                                                                        .Cast<Changeset>().FirstOrDefault().ChangesetId;
+
+                        rootBranch = new RootBranch(rootChangesetInParentBranch, rootChangesetInChildBranch, tfsPathBranchToCreate);
+                        renameFromBranch = null;
+                    }
+                    else
+                    {
+                        Trace.TraceWarning($"Branch \"{tfsPathBranchToCreate}\": unexpected comment at creation: {changeset.Comment.Split('\n').First()}");
+                        return;
+
+                        var branchChangesetsInTargetBranch = GetMergeInfo(tfsPathBranchToCreate, tfsPathParentBranch, changeset.ChangesetId, lastChangesetIdToCheck);
+
+                        if (branchChangesetsInTargetBranch == null)
+                        {
+                            throw new GitTfsException("An unexpected error occurred when trying to find the root changeset.\nFailed to find first changeset for " + tfsPathBranchToCreate);
+                        }
+
+                        var rootChangesetInParentBranch = GetRelevantChangesetBasedOnChangeType(
+                            branchChangesetsInTargetBranch, tfsPathParentBranch, tfsPathBranchToCreate, out renameFromBranch);
+
+                        var rootChangesetMergeInfo = branchChangesetsInTargetBranch.First();
+
+                        // If the merge info indicates our parent branch root changeset is the source, then our child changeset
+                        // will be the target. Otherwise, they're swapped.
+                        var rootChangesetInChildBranch = rootChangesetMergeInfo.SourceChangeset == rootChangesetInParentBranch ?
+                            rootChangesetMergeInfo.TargetChangeset : rootChangesetMergeInfo.SourceChangeset;
+
+                        rootBranch = new RootBranch(rootChangesetInParentBranch, rootChangesetInChildBranch, tfsPathBranchToCreate);
+                    }
+
                     var added = AddNewRootBranch(rootBranches, rootBranch);
 
                     if (added && renameFromBranch != null)
