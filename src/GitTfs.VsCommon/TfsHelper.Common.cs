@@ -20,6 +20,7 @@ using StructureMap.Attributes;
 using ChangeType = Microsoft.TeamFoundation.VersionControl.Client.ChangeType;
 using IdentityNotFoundException = Microsoft.TeamFoundation.VersionControl.Client.IdentityNotFoundException;
 using Microsoft.TeamFoundation.Build.Client;
+using System.Text.RegularExpressions;
 
 namespace GitTfs.VsCommon
 {
@@ -342,6 +343,21 @@ namespace GitTfs.VsCommon
                                                                         .Cast<Changeset>().FirstOrDefault().ChangesetId;
 
                         rootBranch = new RootBranch(rootChangesetInParentBranch, rootChangesetInChildBranch, tfsPathBranchToCreate);
+                        renameFromBranch = null;
+                    }
+                    else if (changeset.Comment.StartsWith("ChangesetVersionSpec instance ", StringComparison.Ordinal))
+                    {
+                        var m = new Regex(@"\d+").Match(changeset.Comment);
+
+                        if (!m.Success || !Int32.TryParse(m.ToString(), out int changesetId))
+                        {
+                            Trace.TraceError($"Branch \"{tfsPathBranchToCreate}\": invalid comment at creation: {changeset.Comment.Split('\n').First()}");
+                            return;
+                        }
+
+                        Debug.Assert(changesetId == Int32.Parse(m.NextMatch().ToString()));
+
+                        rootBranch = new RootBranch(changesetId, changeset.ChangesetId, tfsPathBranchToCreate);
                         renameFromBranch = null;
                     }
                     else
